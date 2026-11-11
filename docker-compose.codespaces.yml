@@ -1,4 +1,4 @@
-# Spark standalone cluster for Hands-on L5, L6, L9, L10 and L11, variant for GitHub Codespaces.
+# Spark standalone cluster for Hands-on L5 to L11, variant for GitHub Codespaces.
 # Image: apache/spark:4.2.0  (Spark 4.2.0, Java 21, Scala 2.13, Python 3, SPARK_HOME=/opt/spark)
 #
 # Why a separate file: inside a Codespace, Docker runs "in Docker" and traffic between

@@ -1,124 +1,572 @@
-"""Hands-on L11: Predicting Airbnb Prices with MLlib Pipelines.
 
-Usage (on the Docker cluster from Hands-on L5):
-    spark-submit main.py <task> <shared directory> <seed>
+"""Assignment #4: Ride-Sharing Analytics, from Stream to Model and Back.
 
-    <task>              task1 or task2
-    <shared directory>  the folder mounted in the containers, /opt/spark/work-dir/shared;
-                        data is read from <shared>/data, results are written to
-                        <shared>/output/<task>, models to <shared>/models
-    <seed>              your student ID; it seeds the train/test split (task 1)
-
-task1  splits the data, writes the two sets to Parquet, fits the baseline pipeline of the
-       lecture (bedrooms only) and YOUR full pipeline (all features); evaluates both and
-       saves the full PipelineModel
-task2  loads the saved PipelineModel and scores the test listings, as a scoring job would
-
-Fill in the parts marked TODO. Each task is a function; a task that still returns None is
-reported as not implemented, so the file always runs.
+Usage:
+    spark-submit main.py <part> <shared directory> <seed>
 """
+
 import sys
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, round as sround
+from pyspark.sql.functions import (
+    col, count, sum as ssum, avg, round as sround,
+    window, hour, abs as sabs, lit
+)
 from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.feature import VectorAssembler, StringIndexer, OneHotEncoder
-from pyspark.ml.regression import LinearRegression
+from pyspark.ml.feature import (
+    VectorAssembler, StringIndexer, OneHotEncoder
+)
+from pyspark.ml.regression import LinearRegression, RandomForestRegressor
 from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
 
-if len(sys.argv) != 4 or sys.argv[1] not in ("task1", "task2"):
+
+PARTS = ("part1a", "part1b", "part2", "part3")
+
+if len(sys.argv) != 4 or sys.argv[1] not in PARTS:
     print(__doc__)
     sys.exit(2)
-task, shared, seed = sys.argv[1], sys.argv[2].rstrip("/"), int(sys.argv[3])
-data_dir, out_dir, model_dir = f"{shared}/data", f"{shared}/output/{task}", f"{shared}/models/full"
 
-spark = (SparkSession.builder.appName(f"AirbnbML-{task}")
-         .config("spark.sql.shuffle.partitions", 4).getOrCreate())
+part, shared, seed = sys.argv[1], sys.argv[2].rstrip("/"), int(sys.argv[3])
+
+in_dir = f"{shared}/input"
+stream_dir = f"{shared}/stream"
+out_dir = f"{shared}/output/{part}"
+ckpt_dir = f"{shared}/checkpoint/{part}"
+model_dir = f"{shared}/models/fare"
+
+spark = (
+    SparkSession.builder
+    .appName(f"A4-{part}")
+    .config("spark.sql.shuffle.partitions", 4)
+    .getOrCreate()
+)
+
 spark.sparkContext.setLogLevel("WARN")
 
-# The evaluators used throughout: RMSE and R2 on the price in dollars.
-rmse_eval = RegressionEvaluator(labelCol="price", predictionCol="prediction", metricName="rmse")
-r2_eval = RegressionEvaluator(labelCol="price", predictionCol="prediction", metricName="r2")
+ride_schema = (
+    "ride_id STRING, driver_id STRING, pickup_zone INT, "
+    "distance_km DOUBLE, duration_min DOUBLE, "
+    "payment_type STRING, fare DOUBLE, event_time TIMESTAMP"
+)
+
+trip_schema = (
+    "trip_id STRING, driver_id STRING, pickup_zone INT, "
+    "dropoff_zone INT, pickup_ts TIMESTAMP, "
+    "distance_km DOUBLE, duration_min DOUBLE, "
+    "payment_type STRING, fare DOUBLE"
+)
 
 
-def evaluate(name, predDF):
-    """Print and return (name, rmse, r2) for a DataFrame with price and prediction columns."""
-    rmse, r2 = rmse_eval.evaluate(predDF), r2_eval.evaluate(predDF)
-    print(f"{name:32s} RMSE {rmse:7.1f}   R2 {r2:6.3f}")
-    return (name, round(rmse, 1), round(r2, 3))
+def read_rides():
+    return (
+        spark.readStream
+        .schema(ride_schema)
+        .option("maxFilesPerTrigger", 1)
+        .json(stream_dir)
+    )
 
 
-def save_metrics(rows, name="metrics"):
-    """Write a list of (model, rmse, r2) as one CSV file with a header under out_dir."""
-    df = spark.createDataFrame(rows, ["model", "rmse", "r2"])
-    df.coalesce(1).write.mode("overwrite").option("header", True).csv(f"{out_dir}/{name}")
+def run(query, label):
+    query.awaitTermination()
+
+    print(f"\n=== {label}: micro-batch summary ===")
+    print(
+        f"{'batch':>5} {'input rows':>10} "
+        f"{'watermark':>20} {'state rows':>10}"
+    )
+
+    for p in query.recentProgress:
+        wm = p.get("eventTime", {}).get("watermark", "-")[:19]
+        wm = wm.replace("T", " ")
+        wm = "-" if wm.startswith("1970") else wm
+
+        ops = p.get("stateOperators", [])
+
+        print(
+            f"{p['batchId']:>5} "
+            f"{p['numInputRows']:>10} "
+            f"{wm:>20} "
+            f"{ops[0]['numRowsTotal'] if ops else '-':>10}"
+        )
 
 
-def feature_columns(df):
-    """The categorical and numeric columns of the dataset, from its schema (slide 23)."""
-    categorical = [f for (f, dt) in df.dtypes if dt == "string"]
-    numeric = [f for (f, dt) in df.dtypes if dt == "double" and f != "price"]
-    return categorical, numeric
+# -------------------------------------------------------
+# Part 1a: Revenue per zone per window
+# -------------------------------------------------------
+
+def part1a_zone_windows():
+
+    rides = read_rides()
+
+    windows = (
+        rides
+        .withWatermark("event_time", "3 minutes")
+        .groupBy(
+            window(col("event_time"), "5 minutes"),
+            "pickup_zone"
+        )
+        .agg(
+            count("*").alias("trips"),
+            sround(ssum("fare"), 2).alias("revenue")
+        )
+        .select(
+            col("window.start").alias("window_start"),
+            col("window.end").alias("window_end"),
+            "pickup_zone",
+            "trips",
+            "revenue"
+        )
+    )
+
+    return (
+        windows.writeStream
+        .format("parquet")
+        .outputMode("append")
+        .option("path", out_dir)
+        .option("checkpointLocation", ckpt_dir)
+        .trigger(availableNow=True)
+        .start()
+    )
 
 
-def load_split():
-    """The training and test sets written by task 1."""
-    return spark.read.parquet(f"{data_dir}/split/train"), spark.read.parquet(f"{data_dir}/split/test")
+# -------------------------------------------------------
+# Part 1b: Alerts
+# -------------------------------------------------------
+
+def part1b_alerts():
+
+    from pyspark.sql.functions import when
+
+    rides = read_rides()
+
+    alerts = (
+        rides
+        .filter(
+            (col("fare") > 150) |
+            (col("distance_km") == 0)
+        )
+        .withColumn(
+            "reason",
+            when(col("fare") > 150, "high_fare")
+            .otherwise("zero_distance")
+        )
+        .select(
+            "ride_id",
+            "event_time",
+            "pickup_zone",
+            "distance_km",
+            "duration_min",
+            "fare",
+            "reason"
+        )
+    )
+
+    return (
+        alerts.writeStream
+        .format("csv")
+        .outputMode("append")
+        .option("header", True)
+        .option("timestampFormat", "yyyy-MM-dd HH:mm:ss")
+        .option("path", out_dir)
+        .option("checkpointLocation", ckpt_dir)
+        .trigger(availableNow=True)
+        .start()
+    )
 
 
-# ---------------------------------------------------------------- Task 1: baseline and full pipeline
-def task1_pipelines():
-    """Split the data with YOUR seed, write both sets to Parquet under data/split/{train,test},
-    then fit and evaluate two pipelines on the test set:
+# -------------------------------------------------------
+# Part 2: Train fare model
+# -------------------------------------------------------
 
-      baseline  VectorAssembler(bedrooms) -> LinearRegression            (given, as in the slides)
-      full      StringIndexer (all string columns, handleInvalid="skip") -> OneHotEncoder
-                -> VectorAssembler(one-hot columns + numeric columns) -> LinearRegression
-
-    Save the fitted full PipelineModel under model_dir with write().overwrite().save().
-    Return the list of (name, rmse, r2) tuples from evaluate(); main writes them to
-    output/task1/metrics. Name the models "baseline" and "full".
-    """
-    airbnbDF = spark.read.parquet(f"{data_dir}/sf-airbnb-clean.parquet")
-    trainDF, testDF = airbnbDF.randomSplit([.8, .2], seed=seed)
-    trainDF.write.mode("overwrite").parquet(f"{data_dir}/split/train")
-    testDF.write.mode("overwrite").parquet(f"{data_dir}/split/test")
-    trainDF, testDF = load_split()
-    print(f"seed {seed}: {trainDF.count()} training rows, {testDF.count()} test rows")
-
-    # baseline, exactly as in the lecture
-    vecAssembler = VectorAssembler(inputCols=["bedrooms"], outputCol="features")
-    lr = LinearRegression(featuresCol="features", labelCol="price")
-    baseline = Pipeline(stages=[vecAssembler, lr]).fit(trainDF)
-    results = [evaluate("baseline", baseline.transform(testDF))]
-
-    # full pipeline
-    categorical, numeric = feature_columns(trainDF)
-    # TODO: indexer, encoder, assembler, LinearRegression; fit the Pipeline on trainDF;
-    #       results.append(evaluate("full", <predictions on testDF>)); save the model
-    return None
+def features_of(df, ts_col):
+    return (
+        df.withColumn("hour", hour(col(ts_col)).cast("string"))
+          .withColumn("zone", col("pickup_zone").cast("string"))
+    )
 
 
-# ---------------------------------------------------------------- Task 2: score with the saved model
-def task2_score():
-    """A scoring job: no training data, no fit(). Load the PipelineModel from model_dir,
-    transform the test listings (data/split/test), and write neighbourhood_cleansed,
-    room_type, bedrooms, price, prediction (rounded to 1 decimal) as one CSV file under
-    output/task2/predictions. Print the stage class names of the loaded model and the
-    RMSE of its predictions. Return the DataFrame you wrote.
-    """
-    # TODO
-    return None
+def part2_train():
+
+    rmse_eval = RegressionEvaluator(
+        labelCol="fare",
+        predictionCol="prediction",
+        metricName="rmse"
+    )
+
+    r2_eval = RegressionEvaluator(
+        labelCol="fare",
+        predictionCol="prediction",
+        metricName="r2"
+    )
+
+    trips = spark.read.csv(
+        f"{in_dir}/trips_history.csv",
+        header=True,
+        schema=trip_schema
+    )
+
+    trips = features_of(trips, "pickup_ts")
+
+    trainDF, testDF = trips.randomSplit(
+        [0.8, 0.2],
+        seed=seed
+    )
+
+    trainDF.cache()
+
+    print(
+        f"seed {seed}: "
+        f"{trainDF.count()} training rows, "
+        f"{testDF.count()} test rows"
+    )
+
+    results = []
+    models = {}
+    actual_rmse = {}
+
+    def evaluate(name, model):
+
+        pred = model.transform(testDF)
+
+        rmse = rmse_eval.evaluate(pred)
+        r2 = r2_eval.evaluate(pred)
+
+        print(
+            f"{name:10s} "
+            f"RMSE {rmse:6.2f} "
+            f"R2 {r2:6.3f}"
+        )
+
+        results.append((
+            name,
+            round(rmse, 2),
+            round(r2, 3)
+        ))
+
+        models[name] = model
+        actual_rmse[name] = rmse
+
+    # Baseline: Distance only
+
+    baseline = Pipeline(stages=[
+        VectorAssembler(
+            inputCols=["distance_km"],
+            outputCol="baseline_features"
+        ),
+        LinearRegression(
+            featuresCol="baseline_features",
+            labelCol="fare"
+        )
+    ])
+
+    baseline_model = baseline.fit(trainDF)
+
+    evaluate("baseline", baseline_model)
+
+    # Full model: Categorical + numerical features
+
+    def full_stages():
+
+        categories = [
+            "zone",
+            "payment_type",
+            "hour"
+        ]
+
+        indexed = [
+            name + "_idx"
+            for name in categories
+        ]
+
+        encoded = [
+            name + "_ohe"
+            for name in categories
+        ]
+
+        indexers = [
+            StringIndexer(
+                inputCol=name,
+                outputCol=idx,
+                handleInvalid="keep"
+            )
+            for name, idx in zip(categories, indexed)
+        ]
+
+        encoder = OneHotEncoder(
+            inputCols=indexed,
+            outputCols=encoded
+        )
+
+        assembler = VectorAssembler(
+            inputCols=encoded + [
+                "distance_km",
+                "duration_min"
+            ],
+            outputCol="full_features"
+        )
+
+        return indexers + [encoder, assembler]
+
+    full = Pipeline(
+        stages=full_stages() + [
+            LinearRegression(
+                featuresCol="full_features",
+                labelCol="fare"
+            )
+        ]
+    )
+
+    full_model = full.fit(trainDF)
+
+    evaluate("full", full_model)
+
+    # Tuned model with cross-validation
+
+    tuned_lr = LinearRegression(
+        featuresCol="full_features",
+        labelCol="fare",
+        elasticNetParam=0.0
+    )
+
+    tuned = Pipeline(
+        stages=full_stages() + [tuned_lr]
+    )
+
+    grid = (
+        ParamGridBuilder()
+        .addGrid(
+            tuned_lr.regParam,
+            [0.01, 0.1]
+        )
+        .build()
+    )
+
+    cv = CrossValidator(
+        estimator=tuned,
+        estimatorParamMaps=grid,
+        evaluator=rmse_eval,
+        numFolds=3,
+        parallelism=2,
+        seed=seed
+    )
+
+    cv_model = cv.fit(trainDF)
+
+    evaluate("tuned", cv_model.bestModel)
+
+    # Save model with lowest RMSE
+
+    best_name = min(
+        actual_rmse,
+        key=actual_rmse.get
+    )
+
+    print(f"Saving best model: {best_name}")
+
+    models[best_name].write().overwrite().save(model_dir)
+
+    trainDF.unpersist()
+
+    return results
 
 
-# ---------------------------------------------------------------- main
-if task == "task1":
-    result = task1_pipelines()
-    if result: save_metrics(result)
+# -------------------------------------------------------
+# Part 3: Score streaming rides
+# -------------------------------------------------------
+
+def part3_score(threshold):
+
+    model = PipelineModel.load(model_dir)
+
+    rides = features_of(
+        read_rides(),
+        "event_time"
+    )
+
+    scored = model.transform(rides)
+
+    flagged = (
+        scored
+        .withColumn(
+            "deviation",
+            sround(
+                sabs(
+                    col("fare") - col("prediction")
+                ),
+                2
+            )
+        )
+        .filter(col("deviation") > threshold)
+        .select(
+            "ride_id",
+            "event_time",
+            "pickup_zone",
+            "distance_km",
+            "duration_min",
+            "payment_type",
+            "fare",
+            sround(
+                col("prediction"), 2
+            ).alias("prediction"),
+            "deviation"
+        )
+    )
+
+    return (
+        flagged.writeStream
+        .format("csv")
+        .outputMode("append")
+        .option("header", True)
+        .option("timestampFormat", "yyyy-MM-dd HH:mm:ss")
+        .option("path", out_dir)
+        .option("checkpointLocation", ckpt_dir)
+        .trigger(availableNow=True)
+        .start()
+    )
+
+
+# -------------------------------------------------------
+# Main
+# -------------------------------------------------------
+
+def metrics_of_saved_model():
+
+    m = spark.read.csv(
+        f"{shared}/output/part2/metrics",
+        header=True,
+        inferSchema=True
+    )
+
+    best = m.orderBy("rmse").first()
+
+    return best["model"], float(best["rmse"])
+
+
+if part == "part1a":
+
+    q = part1a_zone_windows()
+
+    if q is not None:
+
+        run(q, part)
+
+        print("\n=== part1a: windows written by the stream ===")
+
+        spark.read.parquet(out_dir) \
+            .orderBy("window_start", "pickup_zone") \
+            .show(100, truncate=False)
+
+        print("=== part1a: the same aggregation in batch ===")
+
+        (
+            spark.read.schema(ride_schema)
+            .json(stream_dir)
+            .groupBy(
+                window(col("event_time"), "5 minutes"),
+                "pickup_zone"
+            )
+            .agg(
+                count("*").alias("trips"),
+                sround(ssum("fare"), 2).alias("revenue")
+            )
+            .select(
+                col("window.start").alias("window_start"),
+                "pickup_zone",
+                "trips",
+                "revenue"
+            )
+            .orderBy("window_start", "pickup_zone")
+            .show(100, truncate=False)
+        )
+
+elif part == "part1b":
+
+    q = part1b_alerts()
+
+    if q is not None:
+
+        run(q, part)
+
+        alerts = spark.read.csv(
+            out_dir,
+            header=True
+        )
+
+        print(f"\n=== part1b: {alerts.count()} alerts ===")
+
+        alerts.groupBy("reason").count().show()
+
+elif part == "part2":
+
+    result = part2_train()
+
+    q = None if result is None else True
+
+    if result:
+
+        (
+            spark.createDataFrame(
+                result,
+                ["model", "rmse", "r2"]
+            )
+            .coalesce(1)
+            .write
+            .mode("overwrite")
+            .option("header", True)
+            .csv(f"{out_dir}/metrics")
+        )
+
 else:
-    result = task2_score()
-if result is None:
-    print(f"\n=== {task}: not implemented yet ===")
+
+    name, rmse = metrics_of_saved_model()
+
+    threshold = round(4 * rmse, 2)
+
+    print(
+        f"saved model: {name}, "
+        f"test RMSE {rmse}; "
+        f"flagging rides with deviation > {threshold}"
+    )
+
+    q = part3_score(threshold)
+
+    if q is not None:
+
+        run(q, part)
+
+        flagged = spark.read.csv(
+            out_dir,
+            header=True,
+            inferSchema=True
+        )
+
+        print(f"\n=== part3: {flagged.count()} rides flagged ===")
+
+        flagged.orderBy(
+            col("deviation").desc()
+        ).show(10, truncate=False)
+
+        print("=== part3: flagged rides per 5-minute window ===")
+
+        (
+            flagged
+            .groupBy(
+                window(col("event_time"), "5 minutes")
+            )
+            .count()
+            .select(
+                col("window.start").alias("window_start"),
+                "count"
+            )
+            .orderBy("window_start")
+            .show()
+        )
+
+
+if q is None:
+    print(f"\n=== {part}: not implemented yet ===")
 else:
-    print(f"\n=== {task} done; results under {out_dir} ===")
+    print(f"\n=== {part} done; results under {out_dir} ===")
+
 spark.stop()
